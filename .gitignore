@@ -6,3 +6,7 @@ __pycache__/
 screenshots/
 .pytest_cache/
 *.egg-info/
+
+# 개인 사진이 저장소에 올라가지 않도록
+posts/images/*
+!posts/images/.gitkeep

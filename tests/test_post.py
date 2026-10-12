@@ -65,3 +65,45 @@ def test_generate_post_refusal():
     client, _ = _fake_client("", stop_reason="refusal")
     with pytest.raises(RuntimeError):
         generate_post("주제", model="claude-opus-5-5", client=client)
+
+
+def test_segments_and_image_paths():
+    post = Post(title="t", body="첫 문단\n\n![바다](posts/images/a.jpg)\n\n둘째\n\n![](<my photo.png>)")
+    assert post.segments() == [("text", "첫 문단"), ("image", "posts/images/a.jpg"),
+                               ("text", "둘째"), ("image", "my photo.png")]
+    assert post.image_paths() == ["posts/images/a.jpg", "my photo.png"]
+
+
+def test_resolve_image(tmp_path):
+    from naverblog.post import resolve_image
+    (tmp_path / "drafts").mkdir()
+    (tmp_path / "img.jpg").write_bytes(b"x")
+    assert resolve_image("img.jpg", tmp_path / "drafts", tmp_path) == (tmp_path / "img.jpg").resolve()
+    with pytest.raises(FileNotFoundError):
+        resolve_image("none.jpg", tmp_path / "drafts", tmp_path)
+
+
+def test_schedule_roundtrip_and_validation():
+    from naverblog.post import parse_schedule, validate_schedule
+    post = Post.loads("---\ntitle: t\nschedule: 2026-10-15 09:30\n---\n본문")
+    assert post.schedule == datetime(2026, 10, 15, 9, 30)
+    assert Post.loads(post.dumps()).schedule == post.schedule
+    assert parse_schedule("2026.10.15 09:30") == datetime(2026, 10, 15, 9, 30)
+    now = datetime(2026, 10, 12, 9, 0)
+    validate_schedule(datetime(2026, 10, 12, 10, 0), now)
+    with pytest.raises(ValueError):
+        validate_schedule(datetime(2026, 10, 12, 10, 5), now)   # 10분 단위 아님
+    with pytest.raises(ValueError):
+        validate_schedule(datetime(2026, 10, 12, 9, 0), now)    # 과거
+
+
+def test_generate_post_with_images(tmp_path):
+    from PIL import Image
+    img = tmp_path / "a.jpg"
+    Image.new("RGB", (3000, 2000), "blue").save(img)
+    client, calls = _fake_client('{"title": "t", "tags": [], "body": "본문 ![바다](a.jpg)"}')
+    post = generate_post("주제", model="m", images=[("a.jpg", img), ("b c.jpg", img)], client=client)
+    content = calls["messages"][0]["content"]
+    assert [b["type"] for b in content] == ["text", "image", "text", "image", "text"]
+    assert "![설명](<b c.jpg>)" in content[2]["text"]
+    assert post.body.endswith("![](<b c.jpg>)")  # 빠진 사진은 끝에 붙음

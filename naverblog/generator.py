@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
+from pathlib import Path
 
 import anthropic
+from PIL import Image, ImageOps
 
-from .post import Post
+from .post import IMAGE_EXTS, Post, image_markdown
+
+# API 로 보낼 때만 줄인다(업로드는 원본 사용). 긴 변 1568px 이 넘으면 모델이 어차피 줄여서 본다.
+_MAX_EDGE = 1568
 
 SYSTEM_PROMPT = """\
 당신은 네이버 블로그에 글을 쓰는 한국어 블로거입니다.
@@ -36,6 +43,13 @@ POST_SCHEMA = {
     "additionalProperties": False,
 }
 
+IMAGE_INSTRUCTIONS = """\
+첨부한 사진들을 보고 내용에 맞게 글에 배치해 주세요.
+- 각 사진은 정확히 한 번, 어울리는 문단 사이에 단독 줄로 넣습니다.
+- 사진마다 적힌 표기를 그대로 쓰고, `설명` 부분만 사진에 맞는 짧은 설명으로 바꿉니다. 괄호 안 경로는 한 글자도 바꾸지 않습니다.
+- 사진에 보이는 내용을 본문에 자연스럽게 녹여 쓰되, 사진으로 확인할 수 없는 사실은 지어내지 않습니다.
+"""
+
 
 class GenerationError(RuntimeError):
     pass
@@ -54,18 +68,54 @@ def build_prompt(topic: str, keywords: list[str], tone: str | None, length: int,
     return "\n".join(lines) + "\n\n위 조건으로 네이버 블로그 글을 작성해 주세요."
 
 
+def encode_image(path: Path) -> dict:
+    """사진을 API 입력용 base64 JPEG 블록으로 만든다(휴대폰 사진 회전 정보 반영)."""
+    with Image.open(path) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((_MAX_EDGE, _MAX_EDGE))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+    data = base64.standard_b64encode(buf.getvalue()).decode()
+    return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}}
+
+
+def build_content(prompt: str, images: list[tuple[str, Path]]) -> str | list[dict]:
+    """images: (글에 적을 경로, 실제 파일) 목록."""
+    if not images:
+        return prompt
+    content: list[dict] = []
+    for i, (label, path) in enumerate(images, 1):
+        content.append({"type": "text", "text": f"사진 {i} — 글에 넣을 표기: {image_markdown('설명', label)}"})
+        content.append(encode_image(path))
+    content.append({"type": "text", "text": f"{prompt}\n\n{IMAGE_INSTRUCTIONS}"})
+    return content
+
+
+def ensure_images(body: str, labels: list[str]) -> str:
+    """모델이 빠뜨린 사진은 본문 끝에 붙인다."""
+    missing = [label for label in labels if label not in body]
+    if missing:
+        body = body.rstrip() + "\n\n" + "\n\n".join(image_markdown("", m) for m in missing)
+    return body
+
+
 def generate_post(topic: str, *, model: str, keywords: list[str] | None = None,
                   tone: str | None = None, length: int = 2000,
-                  notes: str | None = None,
+                  notes: str | None = None, images: list[tuple[str, Path]] | None = None,
                   client: anthropic.Anthropic | None = None) -> Post:
     client = client or anthropic.Anthropic()
     keywords = keywords or []
+    images = images or []
+    for _, path in images:
+        if path.suffix.lower() not in IMAGE_EXTS:
+            raise GenerationError(f"지원하지 않는 이미지 형식입니다: {path.name}")
 
     response = client.beta.messages.create(
         model=model,
         max_tokens=16000,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": build_prompt(topic, keywords, tone, length, notes)}],
+        messages=[{"role": "user",
+                   "content": build_content(build_prompt(topic, keywords, tone, length, notes), images)}],
         output_config={
             "effort": "medium",
             "format": {"type": "json_schema", "schema": POST_SCHEMA},
@@ -90,4 +140,5 @@ def generate_post(topic: str, *, model: str, keywords: list[str] | None = None,
     meta = {"topic": topic}
     if keywords:
         meta["keywords"] = keywords
-    return Post(title=data["title"].strip(), body=data["body"], tags=tags, meta=meta)
+    body = ensure_images(data["body"], [label for label, _ in images])
+    return Post(title=data["title"].strip(), body=body, tags=tags, meta=meta)
